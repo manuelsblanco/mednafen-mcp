@@ -27,3 +27,12 @@
 /src/sexyal/Makefile
 /src/ss/Makefile
 
+
+# Local MCP builds and runtime artifacts
+/build-mcp/
+/build-wswan/
+/configure-output.log
+__pycache__/
+*.pyc
+/mcp/runtime/
+/mcp/local/

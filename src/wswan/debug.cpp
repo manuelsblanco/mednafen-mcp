@@ -22,11 +22,15 @@
 #include "memory.h"
 #include "gfx.h"
 #include <trio/trio.h>
+#include "../../mcp/bridge.hpp"
+#include "../state-driver.h"
 
 namespace MDFN_IEN_WSWAN
 {
 
 #define NUMBT 32
+
+static mednafen_mcp::Bridge RemoteDebugger;
 
 static bool BTEnabled;
 static int BTIndex;
@@ -87,12 +91,14 @@ static uint8 ReadHandler(uint32 A)
  WS_InDebug++;
  ret = WSwan_readmem20(A);
  WS_InDebug--;
+ RemoteDebugger.access("read", A, ret);
 
  return(ret);
 }
 
 static void WriteHandler(uint32 A, uint8 V)
 {
+ RemoteDebugger.access("write", A, V);
  std::vector<WSWAN_BPOINT>::iterator bpit;
 
  for(bpit = BreakPointsWrite.begin(); bpit != BreakPointsWrite.end(); bpit++)
@@ -148,6 +154,7 @@ static void PortWriteHandler(uint32 A, uint8 V)
 
 static void CPUHandler(uint32 PC)
 {
+ RemoteDebugger.instruction(((v30mz_get_reg(NEC_PS) << 4) + PC) & 0xFFFFF);
  std::vector<WSWAN_BPOINT>::iterator bpit;
 
  if(!FoundBPoint)
@@ -173,13 +180,13 @@ static void CPUHandler(uint32 PC)
 
 static void RedoDH(void)
 {
- bool needch = CPUHook || BreakPointsPC.size() || BreakPointsRead.size() || BreakPointsAux0Read.size() || 
+ bool needch = RemoteDebugger.enabled() || CPUHook || BreakPointsPC.size() || BreakPointsRead.size() || BreakPointsAux0Read.size() ||
 	BreakPointsWrite.size() || BreakPointsAux0Write.size() ||
 	BreakPointsIORead.size() || BreakPointsIOWrite.size();
 
  v30mz_debug(needch ? CPUHandler : NULL,
-        (BreakPointsRead.size() || BreakPointsAux0Read.size()) ? ReadHandler : NULL,
-        (BreakPointsWrite.size() || BreakPointsAux0Write.size()) ? WriteHandler : 0,
+        (RemoteDebugger.enabled() || BreakPointsRead.size() || BreakPointsAux0Read.size()) ? ReadHandler : NULL,
+        (RemoteDebugger.enabled() || BreakPointsWrite.size() || BreakPointsAux0Write.size()) ? WriteHandler : 0,
 	(BreakPointsIORead.size()) ? PortReadHandler : NULL,
 	(BreakPointsIOWrite.size()) ? PortWriteHandler : NULL,
         BTEnabled ? WSwanDBG_AddBranchTrace : NULL);
@@ -474,6 +481,78 @@ static const RegGroupType MiscRegsGroup =
  Misc_SetRegister,
 };
 
+uint16 WSwanDBG_RemoteButtons(uint16 raw)
+{
+ return RemoteDebugger.buttons(raw);
+}
+
+void WSwanDBG_RemoteFrame(EmulateSpecStruct* espec)
+{
+ #ifdef MEDNAFEN_MCP_POSIX
+ static uint64_t previous=0,last_saved=0;
+ static unsigned stable=0,sequence=0;
+ if(!RemoteDebugger.enabled() || espec->skip) return;
+ const auto* surface=espec->surface;
+ auto color=[&](int x,int y,int& r,int& g,int& b) {
+  const auto offset=y*surface->pitchinpix+x;
+  uint32 pixel=surface->format.opp==2 ? surface->pixels16[offset] : surface->pixels[offset];
+  surface->DecodeColor(pixel,r,g,b);
+ };
+ bool automatic=false;
+ if(RemoteDebugger.auto_capture())
+ {
+  const bool dialogue=wsRAM[0x1267]&0x80;
+  uint64_t hash=1469598103934665603ULL;
+  unsigned whites=0;
+  for(int y=dialogue?8:0;y<(dialogue?40:120);y++)
+   for(int x=dialogue?80:0;x<224;x++)
+   {
+    int r,g,b;color(x,y,r,g,b);
+    const bool white=r>=238&&g>=238&&b>=238;
+    whites+=white;hash=(hash^uint64_t(white))*1099511628211ULL;
+   }
+  stable=hash==previous ? stable+1 : 0;
+  previous=hash;
+  if(whites>=12&&stable>=12&&hash!=last_saved){automatic=true;last_saved=hash;}
+ }
+ auto write_ppm=[&](const std::string& path) {
+  std::string data="P6\n224 144\n255\n";
+  for(int y=0;y<144;y++)
+   for(int x=0;x<224;x++)
+   {
+    int r,g,b;color(x,y,r,g,b);
+    data.push_back(r);data.push_back(g);data.push_back(b);
+   }
+  const auto tmp=path+".tmp";
+  int fd=open(tmp.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,0600);
+  if(fd<0) return;
+  size_t done=0;
+  while(done<data.size()) { const auto n=write(fd,data.data()+done,data.size()-done); if(n<=0)break;done+=n; }
+  close(fd);
+  if(done==data.size()) rename(tmp.c_str(),path.c_str());
+ };
+ if(RemoteDebugger.capture_requested())
+ {
+  write_ppm(RemoteDebugger.capture_path());RemoteDebugger.captured();
+ }
+ if(RemoteDebugger.save_requested())
+ {
+  const auto path=RemoteDebugger.directory()+"/checkpoint.mcs";
+  MDFNI_SaveState(path.c_str(),NULL,surface,&espec->DisplayRect,espec->LineWidths);
+  RemoteDebugger.saved();
+ }
+ if(automatic)
+ {
+  std::ostringstream name;name<<RemoteDebugger.directory()<<"/auto-"<<std::setw(6)<<std::setfill('0')<<++sequence;
+  write_ppm(name.str()+".ppm");
+  const auto state=name.str()+".mcs";
+  MDFNI_SaveState(state.c_str(),NULL,surface,&espec->DisplayRect,espec->LineWidths);
+ }
+ #else
+ (void)espec;
+ #endif
+}
+
 void WSwanDBG_Init(void)
 {
  WS_InDebug = 0;
@@ -484,6 +563,33 @@ void WSwanDBG_Init(void)
 
  MDFNDBG_AddRegGroup(&V30MZRegsGroup);
  MDFNDBG_AddRegGroup(&MiscRegsGroup);
+
+ mednafen_mcp::Backend backend;
+ backend.registers = []() {
+  const char* names[] = {"IP","AX","CX","DX","BX","SP","BP","SI","DI","FLAGS","ES","CS","SS","DS"};
+  const int ids[] = {NEC_PC,NEC_AW,NEC_CW,NEC_DW,NEC_BW,NEC_SP,NEC_BP,NEC_IX,NEC_IY,NEC_FLAGS,NEC_DS1,NEC_PS,NEC_SS,NEC_DS0};
+  std::ostringstream result; result << "{";
+  for(unsigned i=0;i<14;i++) { if(i) result << ","; result << mednafen_mcp::quote(names[i]) << ":" << v30mz_get_reg(ids[i]); }
+  result << ",\"ROMBBSLCT\":" << WSwan_MemoryGetRegister(MEMORY_GSREG_ROMBBSLCT,NULL,0);
+  result << ",\"BNK2SLCT\":" << WSwan_MemoryGetRegister(MEMORY_GSREG_BNK2SLCT,NULL,0);
+  result << ",\"BNK3SLCT\":" << WSwan_MemoryGetRegister(MEMORY_GSREG_BNK3SLCT,NULL,0) << "}";
+  return result.str();
+ };
+ backend.read = [](uint32_t address) { return uint8_t(WSwanDBG_MemPeek(address,1,false,false)); };
+ backend.disassemble = [](uint32_t& ip,unsigned count) {
+  std::ostringstream result; result << "[";
+  for(unsigned i=0;i<count;i++) {
+   char text[1024]; uint32 address=ip;
+   WSwanDBG_Disassemble(address,0xFFFFFFFF,text);
+   if(i) result << ",";
+   result << "{\"ip\":" << ip << ",\"text\":" << mednafen_mcp::quote(text) << "}";
+   ip=address;
+  }
+  result << "]"; return result.str();
+ };
+ RemoteDebugger.init(getenv("MEDNAFEN_MCP_DIR"),backend);
+ RedoDH();
+
 }
 
 

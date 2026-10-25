@@ -95,6 +95,9 @@ static void Emulate(EmulateSpecStruct *espec)
   WSwan_SetSoundRate(espec->SoundRate);
 
  WSButtonStatus = MDFN_de16lsb(PortDeviceData);
+ #ifdef WANT_DEBUGGER
+ WSButtonStatus = WSwanDBG_RemoteButtons(WSButtonStatus);
+ #endif
  
  MDFNMP_ApplyPeriodicCheats();
 
@@ -107,6 +110,10 @@ static void Emulate(EmulateSpecStruct *espec)
 
  espec->MasterCycles = v30mz_timestamp;
  v30mz_timestamp = 0;
+
+ #ifdef WANT_DEBUGGER
+ WSwanDBG_RemoteFrame(espec);
+ #endif
 
  if(IsWSR)
  {

@@ -30,6 +30,8 @@ void WSwanDBG_ToggleSyntax(void);
 void WSwanDBG_IRQ(int level);
 
 void WSwanDBG_Init(void) MDFN_COLD;
+uint16 WSwanDBG_RemoteButtons(uint16 raw);
+void WSwanDBG_RemoteFrame(EmulateSpecStruct* espec);
 
 #endif
 
